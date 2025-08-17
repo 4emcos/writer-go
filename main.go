@@ -12,17 +12,27 @@ import (
 	"time"
 )
 
-type Payment struct {
-	CorrelationID string `json:"correlationId"`
-	Amount        string `json:"amount"`
-}
-
 type ProcessedPayment struct {
 	CorrelationID   string  `json:"correlationId"`
 	Amount          float64 `json:"amount"`
 	RequestedAt     string  `json:"requestedAt"`
 	RequestedAtUnix int64   `json:"requestedAtUnix"`
 	Processed       *bool   `json:"processed,omitempty"`
+	UseFallback     *bool   `json:"useFallback,omitempty"`
+}
+
+type StoreRequest struct {
+	Payment ProcessedPayment `json:"payment"`
+}
+
+type PaymentsSummaryResponse struct {
+	Default  SummaryData `json:"default"`
+	Fallback SummaryData `json:"fallback"`
+}
+
+type SummaryData struct {
+	TotalRequests int64   `json:"totalRequests"`
+	TotalAmount   float64 `json:"totalAmount"`
 }
 
 var (
@@ -224,27 +234,30 @@ func (db *MemoryDatabase) binarySearchEnd(target int64) int {
 	return result
 }
 
-func (db *MemoryDatabase) GetPaymentsSummary(fromUnix, toUnix int64) (int64, float64) {
+func (db *MemoryDatabase) GetPaymentsSummary(fromUnix, toUnix int64) (int64, float64, int64, float64) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
 	dataLen := len(db.data)
 	if dataLen == 0 {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 
 	start := db.binarySearchStart(fromUnix)
 	if start == -1 {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 
 	end := db.binarySearchEnd(toUnix)
 	if end == -1 || end < start {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 
 	var totalRequests int64
 	var totalAmount float64
+
+	var totalRequestsFallback int64
+	var totalAmountFallback float64
 
 	data := db.data
 	maxIdx := len(data)
@@ -252,26 +265,17 @@ func (db *MemoryDatabase) GetPaymentsSummary(fromUnix, toUnix int64) (int64, flo
 	for i := start; i <= end && i < maxIdx; i++ {
 		payment := &data[i]
 		if payment.Processed != nil && *payment.Processed {
+			if payment.UseFallback != nil && *payment.UseFallback {
+				totalRequestsFallback++
+				totalAmountFallback += payment.Amount
+				continue
+			}
 			totalRequests++
 			totalAmount += payment.Amount
 		}
 	}
 
-	return totalRequests, totalAmount
-}
-
-type StoreRequest struct {
-	Payment ProcessedPayment `json:"payment"`
-}
-
-type PaymentsSummaryResponse struct {
-	Default  SummaryData `json:"default"`
-	Fallback SummaryData `json:"fallback"`
-}
-
-type SummaryData struct {
-	TotalRequests int64   `json:"totalRequests"`
-	TotalAmount   float64 `json:"totalAmount"`
+	return totalRequests, totalAmount, totalRequestsFallback, totalAmountFallback
 }
 
 func (db *MemoryDatabase) handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -334,15 +338,15 @@ func (db *MemoryDatabase) handleRequest(w http.ResponseWriter, r *http.Request) 
 				toUnix = time.Now().UnixMilli()
 			}
 
-			totalRequests, totalAmount := db.GetPaymentsSummary(fromUnix, toUnix)
+			totalRequests, totalAmount, totalRequestsFallback, totalAmountFallback := db.GetPaymentsSummary(fromUnix, toUnix)
 
 			response := responsePool.Get().(*PaymentsSummaryResponse)
 			defer responsePool.Put(response)
 
 			response.Default.TotalRequests = totalRequests
 			response.Default.TotalAmount = totalAmount
-			response.Fallback.TotalRequests = 0
-			response.Fallback.TotalAmount = 0
+			response.Fallback.TotalRequests = totalRequestsFallback
+			response.Fallback.TotalAmount = totalAmountFallback
 
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(response); err != nil {
